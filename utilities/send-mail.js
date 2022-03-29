@@ -1,92 +1,220 @@
-'use strict';
-const nodemailer = require('nodemailer');
+'use strict'
+const nodemailer = require('nodemailer')
+const ejs = require('ejs')
+const fs = require('fs')
+const path = require('path')
+const axios = require('axios')
+const $ = require('cheerio')
 
-let config = {
-    auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-    }
+const config = {
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
 }
 
 if (process.env.SMTP_SERVICE != null) {
-    config.service = process.env.SMTP_SERVICE;
+  config.service = process.env.SMTP_SERVICE
 } else {
-    config.host = process.env.SMTP_HOST;
-    config.port = parseInt(process.env.SMTP_PORT);
-    config.secure = process.env.SMTP_SECURE === "false" ? false : true;
+  config.host = process.env.SMTP_HOST
+  config.port = parseInt(process.env.SMTP_PORT)
+  config.secure = process.env.SMTP_SECURE !== 'false'
 }
 
-const transporter = nodemailer.createTransport(config);
+const transporter = nodemailer.createTransport(config)
+const templateName = process.env.TEMPLATE_NAME ? process.env.TEMPLATE_NAME : 'rainbow'
+const noticeTemplate = process.env.MAIL_TEMPLATE_ADMIN ? ejs.compile(process.env.MAIL_TEMPLATE_ADMIN) : ejs.compile(fs.readFileSync(path.resolve(process.cwd(), 'template', templateName, 'notice.ejs'), 'utf8'))
+const sendTemplate = process.env.MAIL_TEMPLATE ? ejs.compile(process.env.MAIL_TEMPLATE) : ejs.compile(fs.readFileSync(path.resolve(process.cwd(), 'template', templateName, 'send.ejs'), 'utf8'))
 
-transporter.verify(function(error, success) {
-    if (error) {
-        console.log('SMTP邮箱配置异常：', error);
-    }
-    if (success) {
-        console.log("SMTP邮箱配置正常！");
-    }
-});
-
+// 提醒站长
 exports.notice = (comment) => {
-    let SITE_NAME = process.env.SITE_NAME;
-    let NICK = comment.get('nick');
-    let COMMENT = comment.get('comment');
-    let POST_URL = process.env.SITE_URL + comment.get('url') + '#' + comment.get('objectId');
-    let SITE_URL = process.env.SITE_URL;
+  // 站长自己发的评论不需要通知
+  if (comment.get('mail') === process.env.TO_EMAIL ||
+    comment.get('mail') === process.env.BLOGGER_EMAIL ||
+    comment.get('mail') === process.env.SMTP_USER) {
+    return
+  }
 
-    let _template = process.env.MAIL_TEMPLATE_ADMIN || '<div style="border-top:2px solid #12ADDB;box-shadow:0 1px 3px #AAAAAA;line-height:180%;padding:0 15px 12px;margin:50px auto;font-size:12px;"><h2 style="border-bottom:1px solid #DDD;font-size:14px;font-weight:normal;padding:13px 0 10px 8px;">        您在<a style="text-decoration:none;color: #12ADDB;" href="${SITE_URL}" target="_blank">${SITE_NAME}</a>上的文章有了新的评论</h2><p><strong>${NICK}</strong>回复说：</p><div style="background-color: #f5f5f5;padding: 10px 15px;margin:18px 0;word-wrap:break-word;">            ${COMMENT}</div><p>您可以点击<a style="text-decoration:none; color:#12addb" href="${POST_URL}" target="_blank">查看回复的完整內容</a><br></p></div></div>';
-    let _subject = process.env.MAIL_SUBJECT_ADMIN || '${SITE_NAME}上有新评论了';
-    let emailSubject = eval('`' + _subject + '`');
-    let emailContent = eval('`' + _template + '`');
+  const name = comment.get('nick')
+  const text = comment.get('comment')
+  const url = process.env.SITE_URL + comment.get('url')
 
-    if (comment.get('isSpam')) {
-        emailSubject = '[SPAM]' + emailSubject;
+  if (!process.env.DISABLE_EMAIL) {
+    const SITE_NAME = process.env.SITE_NAME
+    const emailSubject = process.env.MAIL_SUBJECT_ADMIN ? eval('`' + process.env.MAIL_SUBJECT_ADMIN + '`') : '👉 咚！「' + SITE_NAME + '」上有新评论了'
+    const emailContent = noticeTemplate({
+      siteName: SITE_NAME,
+      siteUrl: process.env.SITE_URL,
+      name: name,
+      text: text,
+      url: url + '#' + comment.get('objectId')
+    })
+
+    const mailOptions = {
+      from: '"' + process.env.SENDER_NAME + '" <' + process.env.SMTP_USER + '>',
+      to: process.env.TO_EMAIL || process.env.BLOGGER_EMAIL || process.env.SMTP_USER,
+      subject: emailSubject,
+      html: emailContent
     }
 
-    let mailOptions = {
-        from: '"' + process.env.SENDER_NAME + '" <' + process.env.SENDER_EMAIL + '>',
-        to: process.env.BLOGGER_EMAIL || process.env.SENDER_EMAIL,
-        subject: emailSubject,
-        html: emailContent
-    };
-
     transporter.sendMail(mailOptions, (error, info) => {
-        if (error) {
-            return console.log(error);
+      if (error) {
+        return console.error(error)
+      }
+      comment.set('isNotified', true)
+      comment.set('mailNotified', true)
+      comment.save()
+      console.log('收到一条评论, 已邮件提醒站长')
+    })
+  }
+
+  if (process.env.SERVER_KEY != null) {
+    const scContent = `
+#### ${name} 发表评论：
+
+${text}
+
+#### [\[查看评论\]](${url + '#' + comment.get('objectId')})`
+    axios({
+      method: 'post',
+      url: `https://sc.ftqq.com/${process.env.SERVER_KEY}.send`,
+      data: `text=咚！「${process.env.SITE_NAME}」上有新评论了&desp=${scContent}`,
+      headers: {
+        'Content-type': 'application/x-www-form-urlencoded'
+      }
+    })
+      .then(function (response) {
+        if (response.status === 200 && response.data.errmsg === 'success') {
+          comment.set('isNotified', true)
+          comment.set('wechatNotified', true)
+          console.log('已微信提醒站长')
+        } else {
+          console.warn('微信提醒失败:', response.data)
         }
-        console.log('博主通知邮件成功发送: %s', info.response);
-        comment.set('isNotified', true);
-        comment.save();
-    });
+      })
+      .catch(function (error) {
+        console.error('微信提醒失败:', error.message)
+      })
+  }
+  if (process.env.SERVER_TURBO_KEY != null) {
+    const scContent = process.env.SERVER_TURBO_MD ? `
+#### ${name} 发表评论：
+
+${$.load(text.replace(/<img.*?src="(.*?)".*?>/g, "![图片]($1)").replace(/<br>/g, "\n")).text().replace(/\n+/g, "\n\n").replace(/\n+$/g, "")}
+
+#### [查看评论](${url + '#' + comment.get('objectId')})` : `
+${name} 发表评论：
+
+${$.load(text.replace(/<img.*?src="(.*?)".*?>/g, "\n图片: $1\n").replace(/<br>/g, "\n")).text().replace(/\n+/g, "\n\n").replace(/\n+$/g, "")}
+
+查看评论: ${url + '#' + comment.get('objectId')}`
+    axios({
+      method: 'post',
+      url: `https://sctapi.ftqq.com/${process.env.SERVER_TURBO_KEY}.send`,
+      data: `text=咚！「${process.env.SITE_NAME}」上有新评论了&desp=${scContent}`,
+      headers: {
+        'Content-type': 'application/x-www-form-urlencoded'
+      }
+    })
+      .then(function (response) {
+        if (response.status === 200 && response.data.code === 0) {
+          comment.set('isNotified', true)
+          comment.set('wechatNotified', true)
+          console.log('已通过Server酱提醒站长')
+        } else {
+          console.warn('Server酱提醒失败:', response.data)
+        }
+      })
+      .catch(function (error) {
+        console.error('Server酱提醒失败:', error.message)
+      })
+  }
+  if (process.env.QMSG_KEY != null) {
+    /*
+    if (process.env.QQ_SHAKE != null) {
+      axios.get(`https://qmsg.zendee.cn:443/send/${process.env.QMSG_KEY}?msg=${encodeURIComponent('[CQ:shake]')}`)
+        .then(function (response) {
+          if (response.status === 200 && response.data.success === true) {
+            console.log('已发送QQ戳一戳')
+          } else {
+            console.warn('发送QQ戳一戳失败:', response.data)
+          }
+        })
+        .catch(function (error) {
+          console.error('发送QQ戳一戳失败:', error.message)
+        })
+    }
+    */
+    const content = $.load(text.replace(/<img.*?src="(.*?)".*?>/g, "\n[图片]$1\n").replace(/<br>/g, "\n")).text().replace(/\n+/g, "\n").replace(/\n+$/g, "")
+    const scContent = `@face=119@您的 ${process.env.SITE_NAME} 上有新评论了！
+@face=183@${name} 发表评论：
+
+@face=77@@face=77@@face=77@@face=77@@face=77@
+${content}
+@face=76@@face=76@@face=76@@face=76@@face=76@
+
+@face=169@${url + '#' + comment.get('objectId')}`
+    axios.get(`https://qmsg.zendee.cn:443/send/${process.env.QMSG_KEY}?msg=${encodeURIComponent(scContent)}`)
+      .then(function (response) {
+        if (response.status === 200 && response.data.success === true) {
+          comment.set('isNotified', true)
+          comment.set('qqNotified', true)
+          console.log('已QQ提醒站长')
+        } else {
+          console.warn('QQ提醒失败:', response.data)
+        }
+      })
+      .catch(function (error) {
+        console.error('QQ提醒失败:', error.message)
+      })
+  }
+
 }
 
-exports.send = (currentComment, parentComment)=> {
-    let PARENT_NICK = parentComment.get('nick');
-    let SITE_NAME = process.env.SITE_NAME;
-    let NICK = currentComment.get('nick');
-    let COMMENT = currentComment.get('comment');
-    let PARENT_COMMENT = parentComment.get('comment');
-    let POST_URL = process.env.SITE_URL + currentComment.get('url') + '#' + currentComment.get('objectId');
-    let SITE_URL = process.env.SITE_URL;
+// 发送邮件通知他人
+exports.send = (currentComment, parentComment) => {
+  // 站长被 @ 不需要提醒
+  if (parentComment.get('mail') === process.env.TO_EMAIL ||
+    parentComment.get('mail') === process.env.BLOGGER_EMAIL ||
+    parentComment.get('mail') === process.env.SMTP_USER) {
+    return
+  }
+  const PARENT_NICK = parentComment.get('nick')
+  const SITE_NAME = process.env.SITE_NAME
+  const emailSubject = process.env.MAIL_SUBJECT ? eval('`' + process.env.MAIL_SUBJECT + '`') : '👉 叮咚！「' + SITE_NAME + '」上有人@了你'
+  const emailContent = sendTemplate({
+    siteName: SITE_NAME,
+    siteUrl: process.env.SITE_URL,
+    pname: parentComment.get('nick'),
+    ptext: parentComment.get('comment'),
+    name: currentComment.get('nick'),
+    text: currentComment.get('comment'),
+    url: process.env.SITE_URL + currentComment.get('url') + '#' + currentComment.get('pid')
+  })
+  const mailOptions = {
+    from: '"' + process.env.SENDER_NAME + '" <' + process.env.SMTP_USER + '>',
+    to: parentComment.get('mail'),
+    subject: emailSubject,
+    html: emailContent
+  }
 
-    let _subject = process.env.MAIL_SUBJECT || '${PARENT_NICK}，您在『${SITE_NAME}』上的评论收到了回复';
-    let _template = process.env.MAIL_TEMPLATE || '<div style="border-top:2px solid #12ADDB;box-shadow:0 1px 3px #AAAAAA;line-height:180%;padding:0 15px 12px;margin:50px auto;font-size:12px;"><h2 style="border-bottom:1px solid #DDD;font-size:14px;font-weight:normal;padding:13px 0 10px 8px;">        您在<a style="text-decoration:none;color: #12ADDB;" href="${SITE_URL}" target="_blank">            ${SITE_NAME}</a>上的评论有了新的回复</h2>    ${PARENT_NICK} 同学，您曾发表评论：<div style="padding:0 12px 0 12px;margin-top:18px"><div style="background-color: #f5f5f5;padding: 10px 15px;margin:18px 0;word-wrap:break-word;">            ${PARENT_COMMENT}</div><p><strong>${NICK}</strong>回复说：</p><div style="background-color: #f5f5f5;padding: 10px 15px;margin:18px 0;word-wrap:break-word;">            ${COMMENT}</div><p>您可以点击<a style="text-decoration:none; color:#12addb" href="${POST_URL}" target="_blank">查看回复的完整內容</a>，欢迎再次光临<a style="text-decoration:none; color:#12addb" href="${SITE_URL}" target="_blank">${SITE_NAME}</a>。<br></p></div></div>';
-    let emailSubject = eval('`' + _subject + '`');
-    let emailContent = eval('`' + _template + '`');
+  transporter.sendMail(mailOptions, (error, info) => {
+    if (error) {
+      return console.error(error)
+    }
+    currentComment.set('isNotified', true)
+    currentComment.save()
+    console.log(currentComment.get('nick') + ' @了' + parentComment.get('nick') + ', 已通知.')
+  })
+}
 
-    let mailOptions = {
-        from: '"' + process.env.SENDER_NAME + '" <' + process.env.SENDER_EMAIL + '>', // sender address
-        to: parentComment.get('mail'),
-        subject: emailSubject,
-        html: emailContent
-    };
-
-    transporter.sendMail(mailOptions, (error, info) => {
-        if (error) {
-            return console.log(error);
-        }
-        console.log('AT通知邮件成功发送: %s', info.response);
-        currentComment.set('isNotified', true);
-        currentComment.save();
-    });
-};
+// 该方法可验证 SMTP 是否配置正确
+exports.verify = function () {
+  console.log('....')
+  transporter.verify(function (error, success) {
+    if (error) {
+      console.log(error)
+    }
+    console.log('Server is ready to take our messages')
+  })
+}
